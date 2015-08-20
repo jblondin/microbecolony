@@ -3,7 +3,8 @@ import numpy.random as npr
 import random
 import matplotlib.pyplot as plt
 import scipy.stats as ss
-from rtnorm import rtnorm
+import scipy.spatial as sp
+import sys
 
 from PIL import Image
 import array
@@ -122,6 +123,7 @@ def generic_sigm(x,factor):
 class Colony(object):
    def __init__(self,num_bacteria,ident,num_iterations=10,image_size=(400,400),\
          bounds=(-10,10,-10,10),verbose_perf=True):
+      sys.setrecursionlimit(10000)
       self._num_bacteria=int(num_bacteria)
       self._identifier=ident
       self._num_iterations=num_iterations
@@ -143,11 +145,13 @@ class Colony(object):
       self._hunger_death_factor=1.0
 
       self._loc_mean=npr.randn(1,2)[0]
-      self._loc_cov=ss.wishart.rvs(df=2,scale=np.eye(2)*0.2,size=1)
+      self._loc_cov=ss.wishart.rvs(df=2,scale=np.eye(2)*0.05,size=1)
 
-      self._spread_base_step_size=0.5
-      self._wander_base_step_size=0.05
-      self._wander_jump_size=3.0
+      self._spread_motility_stdev=0.5
+      self._jump_motility_stdev=3.0
+      self._wander_motility_stdev=0.04
+      self._max_allowed_losses=5
+      self._bacteria_diameter=0.05
 
       self._base_food_mean=npr.rand(1,2)[0]*2
       self._base_food_cov=ss.wishart.rvs(df=2,scale=np.eye(2)*10,size=1)
@@ -185,7 +189,8 @@ class Colony(object):
          self.generate_statuses()
 
    def generate_locations(self):
-      self._x,self._y=npr.multivariate_normal(self._loc_mean,self._loc_cov,self._num_bacteria).T
+      new_x,new_y=npr.multivariate_normal(self._loc_mean,self._loc_cov,self._num_bacteria).T
+      self.update_loc(new_x,new_y)
       self._deaths_x=np.ones((0,))
       self._deaths_y=np.ones((0,))
 
@@ -251,7 +256,8 @@ class Colony(object):
    def save_food_image(self,status):
       xmin,xmax,ymin,ymax=self._bounds
       h,w=self._image_size
-      x,y=np.mgrid[-10:10:0.1,-10:10:0.1]
+      xmin,xmax,ymin,ymax=self._bounds
+      x,y=np.mgrid[xmin:xmax:0.1,ymin:ymax:0.1]
       pos=np.dstack((x,-y))
       plt.contourf(x,y,self.food_prob(pos))
       plt.axis('off')
@@ -323,15 +329,16 @@ class Colony(object):
          print "num_eaten_food_dists={0} total_eaten_food_weights={1}".format(\
             len(self._eaten_food_dists),np.sum(self._eaten_food_weights))
       with Timer(" microbes foraging",self._verbose_perf) as t:
-         num_spread,avg_dist_spread,num_wandered=self.forage()
+         num_spread,avg_dist_spread,num_wandered,avg_move_count,avg_lost_count=self.forage()
          pct_spread=0.0
          pct_wandered=0.0
          if self._num_bacteria > 0:
             pct_spread=float(num_spread)/self._num_bacteria
             pct_wandered=float(num_wandered)/self._num_bacteria
-         print "num_spread={0} pct_spread={1} avg_dist_spread={2} num_wandered={3}"
-            " pct_wandered={4}".format(num_spread,pct_spread,avg_dist_spread,num_wandered,\
-            pct_wandered)
+         print "num_spread={0} pct_spread={1} avg_dist_spread={2} num_wandered={3}"\
+            " pct_wandered={4} avg_wander_move_count={5} avg_wander_lost_count={6}".format(\
+            num_spread,pct_spread,avg_dist_spread,num_wandered,pct_wandered,avg_move_count,\
+            avg_lost_count)
       with Timer(" microbes transferring",self._verbose_perf) as t:
          self.transfer()
       with Timer(" microbes reproducing and dying",self._verbose_perf) as t:
@@ -399,56 +406,80 @@ class Colony(object):
 
    def forage(self):
       sum_spread_distance=0.0
+      sum_wander_lost=0.0
+      sum_wander_moves=0.0
       num_spread=0
       num_wandered=0
+      new_x=self._x.copy()
+      new_y=self._y.copy()
       for i in range(self._num_bacteria):
          hunger_roll=random.uniform(0,1)
          if hunger_roll<self.hunger_wander_sigm(self._hunger[i]):
             # we're hungry, go wandering!
             before_x=self._x[i]
             before_y=self._y[i]
-            self._x[i],self._y[i]=self.wander(self._x[i],self._y[i],self._motility[i])
+            new_x[i],new_y[i],move_count,lost_count=self.wander(new_x[i],new_y[i])
+            sum_wander_moves+=move_count
+            sum_wander_lost+=lost_count
             num_wandered+=1
          elif hunger_roll<self.hunger_spread_sigm(self._hunger[i]):
             # we're kinda hungry, wriggle around a little bit
-            before_x=self._x[i]
-            before_y=self._y[i]
-            self._x[i],self._y[i],dist=self.move(self._x[i],self._y[i],self._motility[i])
-            # print "before=({0},{1}) after=({2},{3}) dist={4} actual_dist={5}".format(\
-            #    before_x,before_y,self._x[i],self._y[i],dist,
-            #    math.sqrt((self._x[i]-before_x)**2+(self._y[i]-before_y)**2))
-            sum_moved_distance+=dist
+            before_x=new_x[i]
+            before_y=new_y[i]
+            new_x[i],new_y[i]=self.spread(new_x[i],new_y[i])
+            dist=(new_x[i]-before_x)*(new_x[i]-before_x)+\
+               (new_y[i]-before_y)*(new_y[i]-before_y)
+            sum_spread_distance+=dist
             num_spread+=1
 
       avg_spread_distance=0.0
       if num_spread>0:
          avg_spread_distance=sum_spread_distance/num_spread
-      return num_spread,avg_spread_distance,num_wandered
+      avg_wander_move_count=0.0
+      avg_wander_lost_count=0.0
+      if num_wandered>0:
+         avg_wander_move_count=sum_wander_moves/num_wandered
+         avg_wander_lost_count=sum_wander_lost/num_wandered
 
-   def move_random(self,x,y):
-      new_x,new_y=npr.multivariate_normal([0,0],np.eye(2),1)[0]*self._motility_base_step_size
-      return new_x,new_y
 
-   def spread(self,x,y,motility):
-      dist=random.uniform(0.0,motility*self._spread_base_step_size)
-      # print motility,self._motility_base_step_size,dist,theta,dist*math.sin(theta),dist*math.cos(theta)
-      new_x,new_y=self.move_random_direction(x,y,dist)
-      return new_x,new_y,dist
+      self.update_loc(new_x,new_y)
+      return num_spread,avg_spread_distance,num_wandered,avg_wander_move_count,avg_wander_lost_count
 
-   def move_random_direction(self,x,y,dist):
-      theta=random.uniform(0.0,2*math.pi)
-      return move(x,y,dist,theta):
+   def spread(self,x,y):
+      return self.move_random_direction(x,y,self._spread_motility_stdev)
 
-   def move(self,x,y,dist,theta):
-      return x+dist*math.cos(theta),y+dist*math.sin(theta)
+   def move_random_direction(self,x,y,stdev):
+      dx,dy=npr.multivariate_normal([0,0],np.eye(2),1)[0]*stdev
+      return x+dx,y+dy
 
    def wander(self,x,y):
+      lost_count=0
+      move_count=0
+      xmin,xmax,ymin,ymax=self._bounds
+      w_x=0.0
+      w_y=0.0
+      def aggregated():
+         neighbors=self._kd_tree.query_ball_point([w_x,w_y],self._bacteria_diameter)
+         return len(neighbors)>0
+      def lost():
+         return lost_count>self._max_allowed_losses
+
       # jump to random spot
-      wander_x,wander_y=move_random_direction(x,y,self._wander_jump_size)
-      neighbors=self._kd_tree.query_ball_point([x,y],self._bacteria_radius)
-      while len(neighbors)==0:
-         dist=random.uniform(0.0,self._wander_base_step_size)
-         wander_x,wander_y=
+      w_x,w_y=self.move_random_direction(x,y,self._jump_motility_stdev)
+      while not (aggregated() or lost()):
+         before_x=w_x
+         before_y=w_y
+         w_x,w_y=self.move_random_direction(w_x,w_y,self._wander_motility_stdev)
+         move_count+=1
+         # if move_count % 1000==0:
+         #    dist=math.sqrt((before_x-w_x)**2+(before_y-w_y)**2)
+         #    print "Moved {0} times. Loc=({1},{2}) Dist={3}".format(move_count,w_x,w_y,dist)
+         if w_x<xmin or w_x>xmax or w_y<ymin or w_y>ymax:
+            lost_count+=1
+            # start over
+            w_x,w_y=self.move_random_direction(x,y,self._jump_motility_stdev)
+
+      return w_x,w_y,move_count,lost_count
 
 
    def hunger_wander_sigm(self,x):
@@ -528,8 +559,7 @@ class Colony(object):
 
       # all done, save the new state
       self._num_bacteria=new_num_bacteria
-      self._x=new_x
-      self._y=new_y
+      self.update_loc(new_x,new_y)
       self._age=new_age
       self._hunger=new_hunger
       self._deaths_x=np.concatenate((self._deaths_x,additional_deaths_x))
@@ -542,11 +572,16 @@ class Colony(object):
    def reproduce_sigm(self,x):
       return generic_sigm(x,self._age_reproduce_factor)
 
+   def update_loc(self,new_x,new_y):
+      self._x=new_x
+      self._y=new_y
+      self._kd_tree=sp.KDTree(np.array([self._x,self._y]).T)
+
    def reproduce(self):
       pass
 
 if __name__ == "__main__":
    num_colonies=1
    for i in range(num_colonies):
-      c=Colony(num_bacteria=1e3,ident=i+1,verbose_perf=False,num_iterations=200)
+      c=Colony(num_bacteria=1e2,ident=i+1,verbose_perf=False,num_iterations=200)
       c.grow()
