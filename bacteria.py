@@ -58,30 +58,35 @@ def make_rgb_gradient(start,end):
 
    return rgb_gradient
 
-def make_color_gradient(start,end):
-   def color_gradient(alpha):
-      alpha=alpha**0.5
-      return int(squash_8bit((1.0-alpha)*start+alpha*end))
+def make_color_gradient(bg_color,color1,color2):
+   def color_gradient(alpha1,alpha2):
+      alpha1=alpha1**0.01
+      alpha2=alpha2**0.01
+      alpha_sum=alpha1+alpha2
+      if alpha_sum > 1.0:
+         alpha1/=alpha_sum
+         alpha2/=alpha_sum
+      return int(squash_8bit((1.0-alpha_sum)*bg_color+alpha1*color1+alpha2*color2))
    return color_gradient
 
 def generate_image(life_density,death_density,image_filename,verbose_perf):
-   # assert life_density.shape==death_density.shape
+   assert life_density.shape==death_density.shape
    bg=[0,0,0]
    max_life_color=[201,53,65]
    max_death_color=[24,154,221]
-   rgb_gradient=make_rgb_gradient(bg,max_life_color)
-   r_gradient=make_color_gradient(bg[0],max_life_color[0])
-   g_gradient=make_color_gradient(bg[1],max_life_color[1])
-   b_gradient=make_color_gradient(bg[2],max_life_color[2])
+   # rgb_gradient=make_rgb_gradient(bg,max_life_color)
+   r_gradient=make_color_gradient(bg[0],max_life_color[0],max_death_color[0])
+   g_gradient=make_color_gradient(bg[1],max_life_color[1],max_death_color[1])
+   b_gradient=make_color_gradient(bg[2],max_life_color[2],max_death_color[2])
    h,w=life_density.shape
    pixel_list=[0,0,0]*h*w
 
    with Timer("  writing gradients to pixels",verbose_perf) as t:
       for i in range(h):
          for j in range(w):
-            pixel_list[3*(i*w+j)]=r_gradient(life_density[i,j])
-            pixel_list[3*(i*w+j)+1]=g_gradient(life_density[i,j])
-            pixel_list[3*(i*w+j)+2]=b_gradient(life_density[i,j])
+            pixel_list[3*(i*w+j)]=r_gradient(life_density[i,j],death_density[i,j])
+            pixel_list[3*(i*w+j)+1]=g_gradient(life_density[i,j],death_density[i,j])
+            pixel_list[3*(i*w+j)+2]=b_gradient(life_density[i,j],death_density[i,j])
             # pixel_list[3*(i*w+j):3*(i*w+j+1)]=rgb_gradient(density[i,j])
 
    with Timer("  writing png",verbose_perf) as t:
@@ -94,17 +99,26 @@ def real_loc_to_pixel_loc(x,y,h,w,xmin,xmax,ymin,ymax):
    pixel_y=np.fmin((y-ymin)/(ymax-ymin)*h,h-1)
    return pixel_x.astype(int),pixel_y.astype(int)
 
-def measure_density(x,y,h,w):
-   assert len(x)==len(y)
+def measure_density(x,y,d_x,d_y,h,w):
+   assert len(x)==len(y) and len(d_x)==len(d_y)
    density=np.zeros((h,w))
+   d_density=np.zeros((h,w))
    max_density=0
+   max_d_density=0
 
    for i in range(len(x)):
       density[x[i],y[i]]+=1
       max_density=max(density[x[i],y[i]],max_density)
+   for i in range(len(d_x)):
+      d_density[d_x[i],d_y[i]]+=1
+      max_d_density=max(d_density[d_x[i],d_y[i]],max_d_density)
 
-   density/=max_density
-   return density
+   if max_density>0:
+      density/=max_density
+   if max_d_density>0:
+      d_density/=max_d_density
+
+   return density,d_density
 
 def kldivergence(p,q):
    '''
@@ -145,13 +159,13 @@ class Colony(object):
       self._hunger_death_factor=1.0
 
       self._loc_mean=npr.randn(1,2)[0]
-      self._loc_cov=ss.wishart.rvs(df=2,scale=np.eye(2)*0.05,size=1)
+      self._loc_cov=ss.wishart.rvs(df=2,scale=np.eye(2)*0.02,size=1)
 
-      self._spread_motility_stdev=0.5
-      self._jump_motility_stdev=3.0
-      self._wander_motility_stdev=0.04
+      self._spread_motility_stdev=0.01
+      self._jump_motility_stdev=4.0
+      self._wander_motility_stdev=0.05
       self._max_allowed_losses=5
-      self._bacteria_diameter=0.05
+      self._bacteria_diameter=0.1
 
       self._base_food_mean=npr.rand(1,2)[0]*2
       self._base_food_cov=ss.wishart.rvs(df=2,scale=np.eye(2)*10,size=1)
@@ -159,8 +173,8 @@ class Colony(object):
       # generally, reproduce factor should be higher than death factor, which will cause the
       # microbes to reproduce earlier than they die
       # these could be randomly generated?
-      self._age_death_factor=0.25
-      self._age_reproduce_factor=0.5
+      self._age_death_factor=0.2
+      self._age_reproduce_factor=0.8
 
    def grow(self):
       self.init()
@@ -247,11 +261,13 @@ class Colony(object):
       h,w=self._image_size
       with Timer(" converting real number space to pixel space",self._verbose_perf) as t:
          pixel_x,pixel_y=real_loc_to_pixel_loc(self._x,self._y,h,w,xmin,xmax,ymin,ymax)
+         dpixel_x,dpixel_y=real_loc_to_pixel_loc(self._deaths_x,self._deaths_y,h,w,xmin,xmax,ymin,\
+            ymax)
       with Timer(" measuring density",self._verbose_perf) as t:
-         density=measure_density(pixel_x,pixel_y,h,w)
+         density,d_density=measure_density(pixel_x,pixel_y,dpixel_x,dpixel_y,h,w)
       with Timer(" generating image",self._verbose_perf) as t:
          filename=self._save_filename.format(self._ident,status,self._num_bacteria)
-         generate_image(density,None,filename,self._verbose_perf)
+         generate_image(density,d_density,filename,self._verbose_perf)
 
    def save_food_image(self,status):
       xmin,xmax,ymin,ymax=self._bounds
@@ -479,6 +495,8 @@ class Colony(object):
             # start over
             w_x,w_y=self.move_random_direction(x,y,self._jump_motility_stdev)
 
+      if lost():
+         return x,y,move_count,lost_count
       return w_x,w_y,move_count,lost_count
 
 
@@ -583,5 +601,5 @@ class Colony(object):
 if __name__ == "__main__":
    num_colonies=1
    for i in range(num_colonies):
-      c=Colony(num_bacteria=1e2,ident=i+1,verbose_perf=False,num_iterations=200)
+      c=Colony(num_bacteria=1e3,ident=i+1,verbose_perf=False,num_iterations=200)
       c.grow()
